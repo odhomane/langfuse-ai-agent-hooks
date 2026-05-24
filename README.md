@@ -9,7 +9,7 @@ Each hook captures full conversation turns — user messages, assistant response
 | Agent | Folder | Trigger mechanism |
 |---|---|---|
 | [Claude Code](https://claude.ai/code) (Anthropic) | `claude-code/` | `Stop` hook in `settings.json` |
-| [Codex](https://openai.com/codex) (OpenAI desktop) | `codex/` | `notify` in `config.toml` |
+| [Codex](https://openai.com/codex) (OpenAI) | `codex/` | `notify` in `config.toml` |
 | [LiteLLM](https://litellm.ai) | `litellm/` | Native callback (no script needed) |
 
 More agents coming. PRs welcome.
