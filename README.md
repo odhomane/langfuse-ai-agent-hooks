@@ -53,18 +53,21 @@ More agents coming. PRs welcome.
 
 ## Prerequisites
 
+### Claude Code & Codex (Python hooks)
+
 - Python 3.10+
-- Langfuse SDK 4.x: `pip install "langfuse>=4.0,<5"`
-- OpenTelemetry API: `pip install opentelemetry-api`
+- Langfuse SDK 4.x + OpenTelemetry API:
 
 ```bash
 pip install "langfuse>=4.0,<5" opentelemetry-api
-```
-
-On macOS with Homebrew Python:
-```bash
+# or with Homebrew Python
 /opt/homebrew/bin/pip3 install "langfuse>=4.0,<5" opentelemetry-api
 ```
+
+### OpenCode (TypeScript plugin)
+
+- [Bun](https://bun.sh) — used to build and install the plugin
+- Plugin dependencies are installed automatically with `bun install`
 
 ---
 
@@ -86,12 +89,13 @@ See [Langfuse self-hosting docs](https://langfuse.com/docs/deployment/self-host)
 
 Sign up at [cloud.langfuse.com](https://cloud.langfuse.com). Free tier available.
 
-### Create two projects
+### Create one project per agent
 
-Create one Langfuse project per agent so traces are separated:
+Keeping agents in separate Langfuse projects prevents trace mixing and lets you set model pricing independently:
 
 1. **Claude Code** — copy the public and secret keys
 2. **Codex** — copy the public and secret keys
+3. **OpenCode** — copy the public and secret keys
 
 ---
 
@@ -214,7 +218,79 @@ Logs: `~/.codex/state/langfuse_codex_hook.log`
 
 ---
 
-## 4. Model pricing in Langfuse
+## 4. OpenCode setup
+
+### 4a. Build the plugin
+
+```bash
+cd opencode
+bun install
+bun run build
+```
+
+### 4b. Add env vars to your shell profile
+
+OpenCode reads credentials from the shell environment. The plugin uses an `OC_` prefix to
+prevent these keys from interfering with Claude Code or Codex hooks:
+
+```bash
+# OpenCode → Langfuse tracing (opencode-plugin-langfuse-rich)
+# Uses OC_LANGFUSE_* prefix so keys don't bleed into Claude Code or Codex hooks
+export OC_LANGFUSE_PUBLIC_KEY="pk-lf-your-opencode-public-key"
+export OC_LANGFUSE_SECRET_KEY="sk-lf-your-opencode-secret-key"
+export OC_LANGFUSE_BASE_URL="https://your-langfuse.example.com"   # omit for cloud
+export OC_LANGFUSE_ENVIRONMENT="opencode"
+```
+
+Then reload: `source ~/.zshrc`
+
+**Environment variable reference:**
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `OC_LANGFUSE_PUBLIC_KEY` | Yes* | — | Langfuse public key (OpenCode-specific) |
+| `OC_LANGFUSE_SECRET_KEY` | Yes* | — | Langfuse secret key (OpenCode-specific) |
+| `OC_LANGFUSE_BASE_URL` | No | `https://cloud.langfuse.com` | Your Langfuse host |
+| `OC_LANGFUSE_ENVIRONMENT` | No | `opencode` | Environment tag in Langfuse |
+
+*Falls back to `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` if the `OC_` variants are not set.
+
+### 4c. Register the plugin in `~/.config/opencode/opencode.json`
+
+Use the **absolute path** to the `opencode/` folder — OpenCode treats absolute paths as local
+file plugins and loads them directly from disk without hitting the npm registry.
+
+```json
+{
+  "plugin": [
+    "/absolute/path/to/langfuse-ai-agent-hooks/opencode"
+  ],
+  "experimental": {
+    "openTelemetry": true
+  }
+}
+```
+
+> **Note:** Do not add an `"env": { ... }` key — OpenCode does not support it and will refuse
+> to start. Set credentials via shell env vars as shown above.
+
+### 4d. Verify
+
+Restart OpenCode and send a message. After the first response completes, a trace named after
+your message should appear in your Langfuse project. You can also check OpenCode's own log
+(Help → View Logs or `~/.local/share/opencode/log/`) for lines like:
+
+```
+INFO  service=plugin path=/.../.../opencode  loading plugin
+INFO  service=langfuse-opencode  Langfuse OpenCode tracing started → https://...
+```
+
+After rebuild, just restart OpenCode — no reinstall needed since the plugin loads directly
+from the absolute path.
+
+---
+
+## 5. Model pricing in Langfuse
 
 The hooks send model name + token counts. Langfuse computes cost from its built-in model registry — **no pricing is hardcoded in the scripts**, so you never need to update the scripts when Anthropic or OpenAI change prices.
 
@@ -231,17 +307,23 @@ Current pricing reference:
 
 ---
 
-## 5. Troubleshooting
+## 6. Troubleshooting
 
 ### No traces appearing
 
-1. Check environment variables are set: `echo $LANGFUSE_PUBLIC_KEY`
+1. Check environment variables are set:
+   ```bash
+   echo $LANGFUSE_PUBLIC_KEY        # Claude Code / Codex
+   echo $OC_LANGFUSE_PUBLIC_KEY     # OpenCode
+   ```
 2. Check the log file for errors:
    - Claude Code: `tail -f ~/.claude/state/langfuse_hook.log`
    - Codex: `tail -f ~/.codex/state/langfuse_codex_hook.log`
+   - OpenCode: check Help → View Logs in the app, or `~/.local/share/opencode/log/`
 3. Enable debug logging temporarily:
    - Claude Code: set `CC_LANGFUSE_DEBUG: "true"` in `settings.json`
    - Codex: `export CODEX_LANGFUSE_DEBUG=true` before running Codex
+   - OpenCode: logs are always visible in the OpenCode log viewer
 4. Test the hook directly:
    ```bash
    # Claude Code
@@ -274,6 +356,13 @@ The installed Langfuse SDK is outside the `>=4.0,<5` range. Pin it:
 pip install "langfuse>=4.0,<5"
 ```
 
+### OpenCode plugin not loading
+
+- Confirm the path in `opencode.json` is **absolute** (starts with `/`). Relative paths and bare package names hit the npm registry.
+- Confirm `bun run build` has been run in the `opencode/` folder — OpenCode loads from `dist/index.js`.
+- Confirm `experimental.openTelemetry: true` is set (required for the OTEL layer; the event-driven layer still runs without it but logs a warning).
+- Do **not** add `"env": { ... }` to `opencode.json` — that key is not supported and crashes startup.
+
 ### Codex hook not triggering
 
 - Confirm `notify` in `config.toml` uses an **absolute path** (no `~`)
@@ -289,7 +378,7 @@ Your API key is wrong or belongs to a different project. Regenerate the key in L
 ## Adding a new agent
 
 1. Create a new folder: `mkdir <agent-name>/`
-2. Add a `langfuse_hook.py` that reads the agent's session/transcript format and calls `Langfuse(public_key=..., secret_key=..., host=...)` using env vars
+2. Add a hook script or plugin that reads the agent's event/session format and calls Langfuse using env vars
 3. Add a `README.md` explaining the trigger mechanism for that agent
 4. Open a PR
 
@@ -301,10 +390,17 @@ Your API key is wrong or belongs to a different project. Regenerate the key in L
 langfuse-ai-agent-hooks/
 ├── claude-code/
 │   └── hooks/
-│       └── langfuse_hook.py    # Stop hook — reads JSONL transcripts
+│       └── langfuse_hook.py    # Stop hook — reads JSONL transcripts incrementally
 ├── codex/
 │   ├── langfuse_hook.py        # Reads ~/.codex/sessions/**/*.jsonl
 │   └── notify-wrapper.sh       # Called by Codex on every turn-end
+├── opencode/
+│   ├── src/
+│   │   └── index.ts            # TypeScript OpenCode plugin (event-driven + OTEL)
+│   ├── dist/                   # Compiled output (committed so no build step to install)
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── README.md
 ├── litellm/
 │   └── README.md               # Native callback — no script needed
 └── README.md
