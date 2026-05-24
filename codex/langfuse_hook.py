@@ -6,10 +6,15 @@ Reads ~/.codex/sessions/**/*.jsonl and ships conversation turns to Langfuse.
 Triggered by notify-wrapper.sh on every Codex turn-end.
 
 Configuration (environment variables):
-  LANGFUSE_PUBLIC_KEY   Langfuse project public key  (required)
-  LANGFUSE_SECRET_KEY   Langfuse project secret key  (required)
-  LANGFUSE_BASE_URL     Langfuse host URL             (default: https://cloud.langfuse.com)
-  CODEX_LANGFUSE_DEBUG  Set to "true" for verbose logging
+  CODEX_LANGFUSE_PUBLIC_KEY   Langfuse project public key  (required)
+  CODEX_LANGFUSE_SECRET_KEY   Langfuse project secret key  (required)
+  CODEX_LANGFUSE_BASE_URL     Langfuse host URL             (default: https://cloud.langfuse.com)
+  CODEX_LANGFUSE_DEBUG        Set to "true" for verbose logging
+
+  Falls back to the generic LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY /
+  LANGFUSE_BASE_URL if the CODEX_LANGFUSE_* variants are not set.
+  Using the prefixed variants is recommended when running multiple agents
+  (Claude Code, OpenCode) so each agent's keys remain isolated.
 """
 
 import glob
@@ -42,9 +47,9 @@ MAX_CHARS    = 50_000
 RECENT_HOURS = 48
 DEBUG        = os.environ.get("CODEX_LANGFUSE_DEBUG", "").lower() == "true"
 
-PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
-SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
-HOST       = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+PUBLIC_KEY = os.environ.get("CODEX_LANGFUSE_PUBLIC_KEY") or os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+SECRET_KEY = os.environ.get("CODEX_LANGFUSE_SECRET_KEY") or os.environ.get("LANGFUSE_SECRET_KEY", "")
+HOST       = os.environ.get("CODEX_LANGFUSE_BASE_URL") or os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _logger: Optional[logging.Logger] = None
@@ -532,7 +537,7 @@ def main() -> int:
     log_debug("Codex Langfuse hook started")
 
     if not PUBLIC_KEY or not SECRET_KEY:
-        log_debug("LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set; exiting.")
+        log_debug("CODEX_LANGFUSE_PUBLIC_KEY / CODEX_LANGFUSE_SECRET_KEY not set; exiting.")
         return 0
 
     langfuse = None
