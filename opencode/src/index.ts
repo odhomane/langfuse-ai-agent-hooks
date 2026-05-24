@@ -93,13 +93,16 @@ interface SessionEntry {
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 export const LangfusePlugin: Plugin = async ({ client }) => {
-  const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
-  const secretKey = process.env.LANGFUSE_SECRET_KEY;
+  // OC_LANGFUSE_* is preferred so these keys never bleed into Claude Code / Codex hooks
+  const publicKey = process.env.OC_LANGFUSE_PUBLIC_KEY ?? process.env.LANGFUSE_PUBLIC_KEY;
+  const secretKey = process.env.OC_LANGFUSE_SECRET_KEY ?? process.env.LANGFUSE_SECRET_KEY;
   const baseUrl =
+    process.env.OC_LANGFUSE_BASE_URL ??
     process.env.LANGFUSE_BASEURL ??
     process.env.LANGFUSE_BASE_URL ??
     "https://cloud.langfuse.com";
-  const environment = process.env.LANGFUSE_ENVIRONMENT ?? "opencode";
+  const environment =
+    process.env.OC_LANGFUSE_ENVIRONMENT ?? process.env.LANGFUSE_ENVIRONMENT ?? "opencode";
 
   const log = (level: "info" | "warn" | "error", message: string) => {
     try {
@@ -108,7 +111,7 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
   };
 
   if (!publicKey || !secretKey) {
-    log("warn", "Missing LANGFUSE_PUBLIC_KEY or LANGFUSE_SECRET_KEY — tracing disabled");
+    log("warn", "Missing OC_LANGFUSE_PUBLIC_KEY (or LANGFUSE_PUBLIC_KEY) — tracing disabled");
     return {};
   }
 
