@@ -1,3 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin";
 export declare const LangfusePlugin: Plugin;
-export default LangfusePlugin;
+declare const _default: {
+    id: string;
+    server: Plugin;
+};
+export default _default;

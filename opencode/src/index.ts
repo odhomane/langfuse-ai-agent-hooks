@@ -544,4 +544,7 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
   };
 };
 
-export default LangfusePlugin;
+export default {
+  id: "langfuse-opencode",
+  server: LangfusePlugin,
+};
