@@ -1,0 +1,24 @@
+{
+  "name": "opencode-plugin-langfuse-rich",
+  "version": "0.1.0",
+  "description": "Rich Langfuse observability plugin for OpenCode — per-turn traces, generation steps, tool calls, token usage, and file edits",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "keywords": ["opencode", "langfuse", "observability", "llm", "tracing"],
+  "license": "MIT",
+  "dependencies": {
+    "@langfuse/otel": "^4.5.1",
+    "@opencode-ai/plugin": "^1.1.14",
+    "@opentelemetry/sdk-node": "^0.217.0",
+    "langfuse": "^3.36.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/sdk": "^1.0.0",
+    "typescript": "^5.9.3"
+  }
+}

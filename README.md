@@ -11,6 +11,7 @@ Each hook captures full conversation turns — user messages, assistant response
 | [Claude Code](https://claude.ai/code) (Anthropic) | `claude-code/` | `Stop` hook in `settings.json` |
 | [Codex](https://openai.com/codex) (OpenAI) | `codex/` | `notify` in `config.toml` |
 | [LiteLLM](https://litellm.ai) | `litellm/` | Native callback (no script needed) |
+| [OpenCode](https://opencode.ai) | `opencode/` | TypeScript plugin via OpenCode plugin API |
 
 More agents coming. PRs welcome.
 
@@ -37,6 +38,16 @@ More agents coming. PRs welcome.
 - Token usage: input / output / cached / reasoning
 - Model, reasoning_effort, collaboration_mode name
 - Context window size, session metadata, memory citations, system prompt
+
+### OpenCode
+- Full conversation turns with user message preview as trace name
+- Per-LLM-step generation spans: model, usageDetails (input / output / reasoning / cache_read / cache_write), cost, stop_reason
+- Tool spans nested under each generation: tool name, input args, output, timing, error flag (from `ToolPart` state transitions)
+- Reasoning/thinking blocks captured per step
+- File edit spans (`Edit: filename`) from `PatchPart.files`
+- Session metadata: `session_id`, `directory`, `title`, `version`, `cwd`, `model_id`, `provider_id`
+- Dual tracing layers: OTEL `LangfuseSpanProcessor` (baseline) + event-driven (rich per-turn traces)
+- Flushes on `session.idle`; final flush + SDK shutdown on `server.instance.disposed`
 
 ---
 
