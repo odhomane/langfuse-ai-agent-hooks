@@ -278,41 +278,53 @@ WRAPPER_EOF
         ok "$AG_WRAPPER already exists — leaving your keys in place"
     fi
 
-    # Idempotent JSON merge into ~/.antigravity/settings.json's hooks.Stop and
-    # hooks.SessionEnd arrays. Never overwrites existing hook entries (e.g. a
-    # third-party bridge already registered there) — only appends ours if not
-    # already present.
-    AG_SETTINGS="$HOME/.antigravity/settings.json"
-    "$PYTHON" - "$AG_SETTINGS" "$AG_WRAPPER" << 'PYEOF'
+    # The real hook config the Antigravity IDE's language_server reads is
+    # ~/.gemini/config/hooks.json — NOT ~/.antigravity/settings.json (which
+    # looks plausible and even has its own "hooks" key, but is never
+    # consulted; confirmed empirically via language_server.log). Its schema
+    # is also different from Claude Code's: top-level key is an arbitrary
+    # source label, and each event's hook entries must be flat objects
+    # ({"type","command","timeout"}) — a nested {"matcher","hooks":[...]}
+    # wrapper silently fails to parse THE WHOLE FILE (breaking every other
+    # source's hooks too, not just the malformed one). SessionEnd is not a
+    # recognized event in this schema; Stop is what's actually available.
+    AG_HOOKS_JSON="$HOME/.gemini/config/hooks.json"
+    if [[ -d "$HOME/.gemini/config" ]] || mkdir -p "$HOME/.gemini/config" 2>/dev/null; then
+        "$PYTHON" - "$AG_HOOKS_JSON" "$AG_WRAPPER" << 'PYEOF'
 import json, sys, os
 
-settings_path, wrapper_path = sys.argv[1], sys.argv[2]
-entry = {"type": "command", "timeout": 30, "command": wrapper_path}
+hooks_path, wrapper_path = sys.argv[1], sys.argv[2]
+entry = {"type": "command", "command": wrapper_path, "timeout": 30}
 
-if os.path.exists(settings_path):
-    with open(settings_path) as f:
-        settings = json.load(f)
+if os.path.exists(hooks_path):
+    with open(hooks_path) as f:
+        try:
+            data = json.load(f)
+        except Exception:
+            data = None
 else:
-    settings = {}
+    data = {}
 
-settings.setdefault("hooks", {})
-changed = False
-for event in ("Stop", "SessionEnd"):
-    settings["hooks"].setdefault(event, [{"matcher": "*", "hooks": []}])
-    for block in settings["hooks"][event]:
-        hooks_list = block.setdefault("hooks", [])
-        if not any(h.get("command") == wrapper_path for h in hooks_list):
-            hooks_list.append(entry)
-            changed = True
-
-if changed or not os.path.exists(settings_path):
-    with open(settings_path, "w") as f:
-        json.dump(settings, f, indent=2)
-    print("updated")
+if data is None:
+    print("existing hooks.json is not valid JSON — leaving it untouched")
 else:
-    print("already present")
+    data.setdefault("langfuse", {})
+    stop_blocks = data["langfuse"].setdefault("Stop", [])
+    changed = not any(
+        isinstance(b, dict) and b.get("command") == wrapper_path for b in stop_blocks
+    )
+    if changed:
+        stop_blocks.append(entry)
+        with open(hooks_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print("updated")
+    else:
+        print("already present")
 PYEOF
-    ok "Registered Antigravity Stop/SessionEnd hooks in $AG_SETTINGS"
+        ok "Registered Antigravity Stop hook in $AG_HOOKS_JSON"
+    else
+        warn "Could not create $HOME/.gemini/config — skipping Antigravity hook registration"
+    fi
 else
     info "Skipping Antigravity hook (not macOS, or ~/.gemini and ~/.antigravity not found)."
 fi
