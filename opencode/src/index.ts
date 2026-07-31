@@ -1,3 +1,4 @@
+import * as os from "os";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import type { Plugin } from "@opencode-ai/plugin";
 import type {
@@ -13,6 +14,29 @@ import type {
 } from "@opencode-ai/sdk";
 import { Langfuse } from "langfuse";
 import { NodeSDK } from "@opentelemetry/sdk-node";
+import { BatchSpanProcessor, type SpanProcessor, type SpanExporter } from "@opentelemetry/sdk-trace-base";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+
+const HOSTNAME = os.hostname();
+const OS_USER = (() => { try { return os.userInfo().username; } catch { return undefined; } })();
+const PLATFORM = os.platform();
+const PID = process.pid;
+const IP_ADDRESS: string | undefined = await (async () => {
+  try {
+    const res = await Promise.race([
+      fetch("https://api.ipify.org"),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 2000)),
+    ]) as Response;
+    return (await res.text()).trim();
+  } catch {
+    for (const iface of Object.values(os.networkInterfaces())) {
+      for (const addr of iface ?? []) {
+        if (addr.family === "IPv4" && !addr.internal) return addr.address;
+      }
+    }
+    return undefined;
+  }
+})();
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -117,7 +141,59 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
 
   // OTEL layer — automatic baseline tracing
   const processor = new LangfuseSpanProcessor({ publicKey, secretKey, baseUrl, environment });
-  const sdk = new NodeSDK({ spanProcessors: [processor] });
+  const spanProcessors: SpanProcessor[] = [processor];
+
+  // LangWatch dual-export (opt-in, additive, evaluation-period only).
+  // NOTE: this only reaches the automatic baseline OTel layer below, not the
+  // rich per-turn traces built further down via the legacy langfuse.trace()/
+  // .generation()/.span() API (that client ships directly to Langfuse's
+  // ingestion API, bypassing OTel entirely — there is no shared span to fan
+  // out from). Full parity would need a second, LangWatch-SDK-based trace
+  // builder alongside the existing one. Any failure here is logged and
+  // swallowed — must never affect the Langfuse path.
+  if (process.env.OC_LANGWATCH_ENABLED === "true") {
+    const lwApiKey = process.env.OC_LANGWATCH_API_KEY;
+    const lwEndpoint = process.env.OC_LANGWATCH_ENDPOINT ?? "https://app.langwatch.ai";
+    if (!lwApiKey) {
+      log("warn", "OC_LANGWATCH_ENABLED=true but OC_LANGWATCH_API_KEY not set; skipping.");
+    } else {
+      try {
+        const lwExporter = new OTLPTraceExporter({
+          url: `${lwEndpoint.replace(/\/$/, "")}/api/otel/v1/traces`,
+          headers: { Authorization: `Bearer ${lwApiKey}` },
+        });
+        // Langfuse and LangWatch use disjoint OTel attribute namespaces for
+        // input/output (langfuse.observation.input/output vs. langwatch.input/
+        // output), so without mirroring, a span that has real content in
+        // Langfuse shows <empty> in LangWatch. Best-effort only.
+        const mirroringExporter: SpanExporter = {
+          export(spans, resultCallback) {
+            for (const span of spans) {
+              try {
+                const attrs = span.attributes as Record<string, unknown>;
+                const lwIn = attrs["langfuse.observation.input"] ?? attrs["langfuse.trace.input"];
+                const lwOut = attrs["langfuse.observation.output"] ?? attrs["langfuse.trace.output"];
+                if (lwIn !== undefined && attrs["langwatch.input"] === undefined) {
+                  attrs["langwatch.input"] = lwIn as never;
+                }
+                if (lwOut !== undefined && attrs["langwatch.output"] === undefined) {
+                  attrs["langwatch.output"] = lwOut as never;
+                }
+              } catch {}
+            }
+            return lwExporter.export(spans, resultCallback);
+          },
+          shutdown: () => lwExporter.shutdown(),
+        };
+        spanProcessors.push(new BatchSpanProcessor(mirroringExporter));
+        log("info", `LangWatch dual-export wired (baseline OTel layer only) -> ${lwEndpoint}`);
+      } catch (e) {
+        log("warn", `LangWatch dual-export setup failed (Langfuse unaffected): ${e}`);
+      }
+    }
+  }
+
+  const sdk = new NodeSDK({ spanProcessors });
   sdk.start();
 
   // Event-driven layer — rich per-turn traces
@@ -192,9 +268,14 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
           { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
         );
 
+        const errorCount = turn.steps.reduce(
+          (acc, s) => acc + s.tools.filter((t) => t.isError).length, 0
+        );
+
         const trace = langfuse.trace({
           name: traceName,
           sessionId: turn.sessionID,
+          userId: HOSTNAME,
           tags,
           timestamp: turn.userTime,
           input: { role: "user", content: trunc(turn.userText) },
@@ -218,6 +299,12 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
             total_cache_read_tokens: totals.cacheRead,
             total_cache_write_tokens: totals.cacheWrite,
             total_cost: totals.cost,
+            hostname: HOSTNAME,
+            platform: PLATFORM,
+            pid: PID,
+            ...(IP_ADDRESS ? { ip_address: IP_ADDRESS } : {}),
+            ...(OS_USER ? { os_user: OS_USER } : {}),
+            ...(errorCount ? { error_count: errorCount } : {}),
           },
         });
 

@@ -22,6 +22,8 @@ import hashlib
 import json
 import logging
 import os
+import platform
+import socket
 import sys
 import threading
 import time
@@ -37,6 +39,22 @@ try:
 except Exception:
     sys.exit(0)
 
+_HOSTNAME = socket.gethostname()
+try:
+    import urllib.request as _ur
+    with _ur.urlopen("https://api.ipify.org", timeout=2) as _r:
+        _IP_ADDRESS = _r.read().decode().strip()
+except Exception:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+            _s.connect(("8.8.8.8", 80))
+            _IP_ADDRESS = _s.getsockname()[0]
+    except Exception:
+        _IP_ADDRESS = None
+_OS_USER  = os.environ.get("USER") or os.environ.get("USERNAME") or os.environ.get("LOGNAME")
+_PLATFORM = platform.system()
+_PID      = os.getpid()
+
 # ── Config ────────────────────────────────────────────────────────────────────
 CODEX_HOME   = Path.home() / ".codex"
 SESSIONS_DIR = CODEX_HOME / "sessions"
@@ -50,6 +68,16 @@ DEBUG        = os.environ.get("CODEX_LANGFUSE_DEBUG", "").lower() == "true"
 PUBLIC_KEY = os.environ.get("CODEX_LANGFUSE_PUBLIC_KEY") or os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 SECRET_KEY = os.environ.get("CODEX_LANGFUSE_SECRET_KEY") or os.environ.get("LANGFUSE_SECRET_KEY", "")
 HOST       = os.environ.get("CODEX_LANGFUSE_BASE_URL") or os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
+
+# ── LangWatch dual-export (opt-in, additive, never blocks Langfuse) ────────────
+# Evaluation-period parallel export: attaches a second OTLP span processor to the
+# SAME multi-span-processor Langfuse's own tracer uses, so every span already
+# built for Langfuse fans out to LangWatch too, with no separate SDK/client and
+# no duplicated span-building logic. If anything about this fails, it must never
+# affect the Langfuse path — see wire_langwatch_export() below.
+LANGWATCH_ENABLED     = os.environ.get("CODEX_LANGWATCH_ENABLED", "").lower() == "true"
+LANGWATCH_API_KEY     = os.environ.get("CODEX_LANGWATCH_API_KEY", "")
+LANGWATCH_ENDPOINT    = os.environ.get("CODEX_LANGWATCH_ENDPOINT", "https://app.langwatch.ai")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 _logger: Optional[logging.Logger] = None
@@ -424,7 +452,14 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         "model_provider":   smeta.model_provider,
         "personality":      turn.personality,
         "collab_mode_name": turn.collab_mode_name,
+        "hostname":         _HOSTNAME,
+        "pid":              _PID,
+        "platform":         _PLATFORM,
     }
+    if _IP_ADDRESS:
+        trace_metadata["ip_address"] = _IP_ADDRESS
+    if _OS_USER:
+        trace_metadata["os_user"] = _OS_USER
     if turn.context_window:
         trace_metadata["context_window"] = turn.context_window
     if turn.duration_ms is not None:
@@ -439,6 +474,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         trace_name=name,
         tags=tags,
         version=smeta.cli_version or None,
+        user_id=_HOSTNAME,
     ):
         trace_span = _start_backdated(
             langfuse,
@@ -531,6 +567,73 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         trace_span.update(output={"role": "assistant", "content": agent_text})
         trace_span.end(end_time=_to_ns(turn.end_ts or turn.start_ts))
 
+def _mirror_langfuse_io_to_langwatch(span: Any) -> None:
+    """Copy Langfuse's proprietary input/output attrs onto the langwatch.input/
+    langwatch.output keys LangWatch's own ingestion actually reads. Langfuse and
+    LangWatch use disjoint OTel attribute namespaces for the same data, so without
+    this a dual-exported span shows real content in Langfuse but <empty> in
+    LangWatch. Best-effort: any failure here must not affect either export path.
+    """
+    try:
+        # ReadableSpan.attributes always returns a fresh read-only
+        # MappingProxyType — mutating it raises TypeError. The real,
+        # mutable BoundedAttributes store lives on the private _attributes
+        # attribute. On opentelemetry-sdk >=1.43 Span.end() additionally
+        # sets attrs._immutable = True right before handing the span to
+        # processors (freezing it against further writes) — toggle that
+        # flag off for the duration of the write, then restore it, so this
+        # works across the SDK-version skew across the fleet.
+        attrs = getattr(span, "_attributes", None) or getattr(span, "attributes", None)
+        if not attrs:
+            return
+        lw_in = attrs.get("langfuse.observation.input", attrs.get("langfuse.trace.input"))
+        lw_out = attrs.get("langfuse.observation.output", attrs.get("langfuse.trace.output"))
+        was_immutable = getattr(attrs, "_immutable", False)
+        if was_immutable:
+            attrs._immutable = False
+        try:
+            if lw_in is not None and "langwatch.input" not in attrs:
+                attrs["langwatch.input"] = lw_in
+            if lw_out is not None and "langwatch.output" not in attrs:
+                attrs["langwatch.output"] = lw_out
+        finally:
+            if was_immutable:
+                attrs._immutable = True
+    except Exception:
+        pass
+
+
+def wire_langwatch_export(langfuse: "Langfuse") -> None:
+    """Attach a LangWatch OTLP exporter to Langfuse's own multi-span-processor.
+
+    Best-effort only: any failure here is logged and swallowed. This must never
+    prevent or delay the existing Langfuse export path.
+    """
+    if not LANGWATCH_ENABLED:
+        return
+    if not LANGWATCH_API_KEY:
+        log_debug("CODEX_LANGWATCH_ENABLED=true but CODEX_LANGWATCH_API_KEY not set; skipping.")
+        return
+    try:
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+        class _MirroringOTLPSpanExporter(OTLPSpanExporter):
+            def export(self, spans):
+                for _span in spans:
+                    _mirror_langfuse_io_to_langwatch(_span)
+                return super().export(spans)
+
+        exporter = _MirroringOTLPSpanExporter(
+            endpoint=f"{LANGWATCH_ENDPOINT.rstrip('/')}/api/otel/v1/traces",
+            headers={"Authorization": f"Bearer {LANGWATCH_API_KEY}"},
+        )
+        processor = BatchSpanProcessor(exporter)
+        langfuse._otel_tracer.span_processor.add_span_processor(processor)
+        log_debug(f"LangWatch dual-export wired -> {LANGWATCH_ENDPOINT}")
+    except Exception as e:
+        log_debug(f"LangWatch dual-export setup failed (Langfuse unaffected): {type(e).__name__}: {e}")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> int:
     start = time.time()
@@ -546,6 +649,8 @@ def main() -> int:
     except Exception as e:
         log_debug(f"Langfuse init failed: {e}")
         return 0
+
+    wire_langwatch_export(langfuse)
 
     state = load_state()
     total_emitted = 0

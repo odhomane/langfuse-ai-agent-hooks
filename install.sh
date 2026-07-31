@@ -59,20 +59,25 @@ SHELL_PROFILE="$(detect_shell_profile)"
 info "Shell profile: $SHELL_PROFILE"
 
 # ── Python detection ──────────────────────────────────────────────────────────
-detect_python() {
-    if command -v python3 &>/dev/null; then
-        echo "python3"
-    else
-        echo ""
-    fi
-}
-PYTHON="$(detect_python)"
+# IMPORTANT: resolve to the interpreter's real absolute path (sys.executable), not
+# the bare "python3" string. A bare "python3" can be a shell alias (e.g. macOS
+# Homebrew setups often alias python3 -> a specific versioned binary) that only
+# resolves inside an interactive, profile-sourced shell. Hook commands are spawned
+# by Claude Code/Codex/OpenCode as non-interactive subprocesses that do NOT source
+# your shell profile, so a bare "python3" there can silently fall through to a
+# different (often dependency-less) interpreter — e.g. macOS's ancient system stub
+# at /usr/bin/python3 — causing the hook to exit silently with no error and no log.
+if ! command -v python3 &>/dev/null; then
+    err "python3 not found. Install Python 3.10+ before running this script."
+    exit 1
+fi
+PYTHON="$(python3 -c "import sys; print(sys.executable)" 2>/dev/null)"
 if [[ -z "$PYTHON" ]]; then
     err "python3 not found. Install Python 3.10+ before running this script."
     exit 1
 fi
 PYTHON_VERSION="$("$PYTHON" --version 2>&1)"
-info "Python: $PYTHON_VERSION at $(command -v "$PYTHON")"
+info "Python: $PYTHON_VERSION at $PYTHON (resolved absolute path — will be used verbatim in hook commands, never a bare 'python3')"
 
 # ── Helper: append a block to shell profile only if sentinel is absent ─────────
 append_if_absent() {
@@ -107,7 +112,7 @@ ok "Copied claude-code hook → $CLAUDE_HOOKS_DIR/langfuse_hook.py"
 
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
-    cat > "$CLAUDE_SETTINGS" << 'SETTINGS_EOF'
+    cat > "$CLAUDE_SETTINGS" << SETTINGS_EOF
 {
   "env": {
     "TRACE_TO_LANGFUSE": "true",
@@ -120,10 +125,11 @@ if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
   "hooks": {
     "Stop": [
       {
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.claude/hooks/langfuse_hook.py"
+            "command": "$PYTHON ~/.claude/hooks/langfuse_hook.py"
           }
         ]
       }
@@ -135,6 +141,10 @@ SETTINGS_EOF
 else
     warn "$CLAUDE_SETTINGS already exists — skipping creation."
     warn "Make sure it contains the Stop hook and CC_LANGFUSE_* env vars. See README for the snippet."
+    warn "IMPORTANT: the Stop hook command must use an ABSOLUTE interpreter path ($PYTHON on this"
+    warn "machine), never a bare 'python3' — hook subprocesses don't source your shell profile, so a"
+    warn "shell-aliased 'python3' can silently resolve to a different, dependency-less interpreter"
+    warn "and the hook will exit with no error and no log line at all."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -233,6 +243,81 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 5. Antigravity hook (desktop IDE + CLI, macOS only)
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$PLATFORM" == "macos" ]] && [[ -d "$HOME/.gemini" || -d "$HOME/.antigravity" ]]; then
+    info "Setting up Antigravity hook..."
+    AG_HOOKS_DIR="$HOME/.antigravity/hooks"
+    AG_STATE_DIR="$HOME/.antigravity/state"
+    mkdir -p "$AG_HOOKS_DIR" "$AG_STATE_DIR"
+    cp "$REPO_ROOT/antigravity/hooks/langfuse_hook.py" "$AG_HOOKS_DIR/langfuse_hook.py"
+
+    # Antigravity IDE fires hooks as a plain GUI subprocess, not a login shell —
+    # it does not inherit ~/.zshrc exports the way Claude Code's CLI process
+    # does. Credentials must live in this wrapper script instead of the shell
+    # profile. Only write it once; re-running install.sh must not clobber keys
+    # a user has already filled in.
+    AG_WRAPPER="$AG_HOOKS_DIR/run_langfuse_hook.sh"
+    if [[ ! -f "$AG_WRAPPER" ]]; then
+        cat > "$AG_WRAPPER" << WRAPPER_EOF
+#!/bin/sh
+export TRACE_TO_LANGFUSE="true"
+export AG_LANGFUSE_PUBLIC_KEY="pk-lf-REPLACE_ME"
+export AG_LANGFUSE_SECRET_KEY="sk-lf-REPLACE_ME"
+export AG_LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+# export AG_LANGWATCH_ENABLED="true"
+# export AG_LANGWATCH_API_KEY="sk-lw-REPLACE_ME"
+# export AG_LANGWATCH_ENDPOINT="https://app.langwatch.ai"
+export OTEL_BSP_MAX_QUEUE_SIZE="16384"
+export OTEL_BSP_MAX_EXPORT_BATCH_SIZE="1024"
+exec "$PYTHON" "\$HOME/.antigravity/hooks/langfuse_hook.py"
+WRAPPER_EOF
+        chmod +x "$AG_WRAPPER"
+        ok "Created $AG_WRAPPER (fill in AG_LANGFUSE_* keys)"
+    else
+        ok "$AG_WRAPPER already exists — leaving your keys in place"
+    fi
+
+    # Idempotent JSON merge into ~/.antigravity/settings.json's hooks.Stop and
+    # hooks.SessionEnd arrays. Never overwrites existing hook entries (e.g. a
+    # third-party bridge already registered there) — only appends ours if not
+    # already present.
+    AG_SETTINGS="$HOME/.antigravity/settings.json"
+    "$PYTHON" - "$AG_SETTINGS" "$AG_WRAPPER" << 'PYEOF'
+import json, sys, os
+
+settings_path, wrapper_path = sys.argv[1], sys.argv[2]
+entry = {"type": "command", "timeout": 30, "command": wrapper_path}
+
+if os.path.exists(settings_path):
+    with open(settings_path) as f:
+        settings = json.load(f)
+else:
+    settings = {}
+
+settings.setdefault("hooks", {})
+changed = False
+for event in ("Stop", "SessionEnd"):
+    settings["hooks"].setdefault(event, [{"matcher": "*", "hooks": []}])
+    for block in settings["hooks"][event]:
+        hooks_list = block.setdefault("hooks", [])
+        if not any(h.get("command") == wrapper_path for h in hooks_list):
+            hooks_list.append(entry)
+            changed = True
+
+if changed or not os.path.exists(settings_path):
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2)
+    print("updated")
+else:
+    print("already present")
+PYEOF
+    ok "Registered Antigravity Stop/SessionEnd hooks in $AG_SETTINGS"
+else
+    info "Skipping Antigravity hook (not macOS, or ~/.gemini and ~/.antigravity not found)."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Done — print checklist
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""
@@ -252,15 +337,20 @@ echo "   │"
 echo "   └─ OpenCode (Settings → API Keys in your OpenCode Langfuse project)"
 echo "      OC_LANGFUSE_PUBLIC_KEY, OC_LANGFUSE_SECRET_KEY, OC_LANGFUSE_BASE_URL"
 echo ""
+echo "   Antigravity is different — it's a GUI app and does not inherit shell"
+echo "   profile exports. Its keys live directly in the wrapper script instead:"
+echo "     ~/.antigravity/hooks/run_langfuse_hook.sh"
+echo ""
 echo "2. Reload your shell profile:"
 echo "   source $SHELL_PROFILE"
 echo ""
 echo "3. Verify Claude Code hook is wired (check ~/.claude/settings.json has the Stop hook)."
 echo ""
-echo "4. Start a new Codex or OpenCode session and check your Langfuse dashboards."
+echo "4. Start a new Codex, OpenCode, or Antigravity session and check your Langfuse dashboards."
 echo ""
 echo "   Logs:"
-echo "   - Claude Code: tail -f ~/.claude/state/langfuse_hook.log"
-echo "   - Codex:       tail -f ~/.codex/state/langfuse_codex_hook.log"
-echo "   - OpenCode:    check Help → View Logs in the app"
+echo "   - Claude Code:  tail -f ~/.claude/state/langfuse_hook.log"
+echo "   - Codex:        tail -f ~/.codex/state/langfuse_codex_hook.log"
+echo "   - OpenCode:     check Help → View Logs in the app"
+echo "   - Antigravity:  tail -f ~/.antigravity/state/langfuse_hook.log"
 echo ""

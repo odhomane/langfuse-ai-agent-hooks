@@ -7,6 +7,7 @@ Claude Code -> Langfuse hook
 import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
@@ -17,12 +18,30 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# --- Langfuse import (fail-open) ---
+# --- Langfuse import (fail-open, but never silent) ---
+# A bad interpreter (e.g. hook command using a bare "python3" that resolves to a
+# different install than expected — shell aliases don't apply to non-interactive
+# hook subprocesses) must never fail invisibly. Log the failure before exiting.
 try:
     from langfuse import Langfuse, propagate_attributes
     from opentelemetry import trace as otel_trace_api
-except Exception:
+except Exception as _import_exc:
+    try:
+        _state_dir = Path.home() / ".claude" / "state"
+        _state_dir.mkdir(parents=True, exist_ok=True)
+        with open(_state_dir / "langfuse_hook.log", "a") as _f:
+            _f.write(
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [ERROR] "
+                f"Import failed under interpreter {sys.executable} "
+                f"(python {sys.version.split()[0]}): {type(_import_exc).__name__}: {_import_exc}. "
+                f"Check the Stop hook command in settings.json uses an absolute interpreter path "
+                f"with langfuse installed, not a bare 'python3'.\n"
+            )
+    except Exception:
+        pass
     sys.exit(0)
+
+_HOSTNAME = socket.gethostname()
 
 # --- Paths ---
 STATE_DIR = Path.home() / ".claude" / "state"
@@ -704,6 +723,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
         "assistant_message_count": len(turn.assistant_msgs),
         "total_input_tokens":      total_input,
         "total_output_tokens":     total_output,
+        "hostname":                _HOSTNAME,
     }
     if total_cache_read:
         trace_metadata["total_cache_read_tokens"] = total_cache_read
@@ -738,6 +758,7 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
         trace_name=trace_name,
         tags=tags,
         version=si.version or None,
+        user_id=_HOSTNAME,
     ):
         trace_span = _start_backdated(
             langfuse,
@@ -918,6 +939,75 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
         trace_span.update(output={"role": "assistant", "content": final_assistant_text})
         trace_span.end(end_time=_to_ns(turn_end_ts or last_assistant_ts or user_ts))
 
+# ── LangWatch dual-export (opt-in, additive, never blocks Langfuse) ────────────
+# Same pattern as the Codex hook: attaches a second OTLP span processor to the
+# SAME multi-span-processor Langfuse's own tracer uses, so every span already
+# built for Langfuse fans out to LangWatch too. Any failure here is logged and
+# swallowed — must never affect the Langfuse path.
+def _mirror_langfuse_io_to_langwatch(span: Any) -> None:
+    """Copy Langfuse's proprietary input/output attrs onto the langwatch.input/
+    langwatch.output keys LangWatch's own ingestion actually reads. Langfuse and
+    LangWatch use disjoint OTel attribute namespaces for the same data, so without
+    this a dual-exported span shows real content in Langfuse but <empty> in
+    LangWatch. Best-effort: any failure here must not affect either export path.
+    """
+    try:
+        # ReadableSpan.attributes always returns a fresh read-only
+        # MappingProxyType — mutating it raises TypeError. The real,
+        # mutable BoundedAttributes store lives on the private _attributes
+        # attribute. On opentelemetry-sdk >=1.43 Span.end() additionally
+        # sets attrs._immutable = True right before handing the span to
+        # processors (freezing it against further writes) — toggle that
+        # flag off for the duration of the write, then restore it, so this
+        # works across the SDK-version skew across the fleet.
+        attrs = getattr(span, "_attributes", None) or getattr(span, "attributes", None)
+        if not attrs:
+            return
+        lw_in = attrs.get("langfuse.observation.input", attrs.get("langfuse.trace.input"))
+        lw_out = attrs.get("langfuse.observation.output", attrs.get("langfuse.trace.output"))
+        was_immutable = getattr(attrs, "_immutable", False)
+        if was_immutable:
+            attrs._immutable = False
+        try:
+            if lw_in is not None and "langwatch.input" not in attrs:
+                attrs["langwatch.input"] = lw_in
+            if lw_out is not None and "langwatch.output" not in attrs:
+                attrs["langwatch.output"] = lw_out
+        finally:
+            if was_immutable:
+                attrs._immutable = True
+    except Exception:
+        pass
+
+
+def wire_langwatch_export(langfuse: "Langfuse") -> None:
+    if os.environ.get("CC_LANGWATCH_ENABLED", "").lower() != "true":
+        return
+    api_key = os.environ.get("CC_LANGWATCH_API_KEY", "")
+    endpoint = os.environ.get("CC_LANGWATCH_ENDPOINT", "https://app.langwatch.ai")
+    if not api_key:
+        debug("CC_LANGWATCH_ENABLED=true but CC_LANGWATCH_API_KEY not set; skipping.")
+        return
+    try:
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+        class _MirroringOTLPSpanExporter(OTLPSpanExporter):
+            def export(self, spans):
+                for _span in spans:
+                    _mirror_langfuse_io_to_langwatch(_span)
+                return super().export(spans)
+
+        exporter = _MirroringOTLPSpanExporter(
+            endpoint=f"{endpoint.rstrip('/')}/api/otel/v1/traces",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        processor = BatchSpanProcessor(exporter)
+        langfuse._otel_tracer.span_processor.add_span_processor(processor)
+        debug(f"LangWatch dual-export wired -> {endpoint}")
+    except Exception as e:
+        debug(f"LangWatch dual-export setup failed (Langfuse unaffected): {type(e).__name__}: {e}")
+
 # ----------------- Main -----------------
 def main() -> int:
     start = time.time()
@@ -950,6 +1040,8 @@ def main() -> int:
         langfuse = Langfuse(public_key=public_key, secret_key=secret_key, host=host)
     except Exception:
         return 0
+
+    wire_langwatch_export(langfuse)
 
     try:
         with FileLock(LOCK_FILE):
