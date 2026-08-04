@@ -42,10 +42,62 @@ const IP_ADDRESS: string | undefined = await (async () => {
 
 const MAX_CHARS = 50_000;
 
+// ── Secret redaction ─────────────────────────────────────────────────────────
+// Applied to every string before it leaves this process for Langfuse/LangWatch.
+// Tool output (bash, etc.) routinely contains real credentials that happened to
+// be on screen -- cat'd key files, env dumps, connection strings -- with no
+// awareness on the model's part that it's sensitive. A retroactive scan of this
+// exact instance's trace history found real RSA private keys, GitHub PATs,
+// Slack tokens, and hundreds of API keys sitting in plaintext across Langfuse
+// and LangWatch. This mirrors the Python hooks' pattern set exactly.
+const SECRET_REPLACERS: Array<[RegExp, (m: string, ...groups: string[]) => string]> = [
+  [/-----BEGIN[ A-Z]*PRIVATE KEY-----[\s\S]*?-----END[ A-Z]*PRIVATE KEY-----/g, () => "[REDACTED:private_key]"],
+  [/\bAKIA[0-9A-Z]{16}\b/g, () => "[REDACTED:aws_key_id]"],
+  [/\bsk-lf-[a-f0-9-]{20,}\b/g, () => "[REDACTED:langfuse_secret_key]"],
+  [/\bpk-lf-[a-f0-9-]{20,}\b/g, () => "[REDACTED:langfuse_public_key]"],
+  [/\bsk-lw-[A-Za-z0-9_]{20,}\b/g, () => "[REDACTED:langwatch_key]"],
+  [/\bgh[pousr]_[A-Za-z0-9]{30,}\b/g, () => "[REDACTED:github_token]"],
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, () => "[REDACTED:slack_token]"],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, () => "[REDACTED:jwt]"],
+  [/\bAIza[0-9A-Za-z_-]{35}\b/g, () => "[REDACTED:google_api_key]"],
+  [/\bnpm_[A-Za-z0-9]{30,}\b/g, () => "[REDACTED:npm_token]"],
+  [/\bsk-[A-Za-z0-9]{32,}\b/g, () => "[REDACTED:api_key]"],
+  // key=value / key: "value" for common secret-ish key names -- keep the key
+  // name, drop the value. No leading \b: PGPASSWORD, MYSQL_PWD etc. have
+  // "password"/"secret" glued onto a prefix with no word boundary.
+  [
+    /((?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token)["']?\s*[:=]\s*)(["']?)([^"'\s]{6,})\2/gi,
+    (_m, p1: string, p2: string) => `${p1}${p2}[REDACTED]${p2}`,
+  ],
+  // scheme://user:password@host -- keep the shape, drop just the password.
+  [/([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/[^:/\s"']+):[^@/\s"']+@/g, (_m, p1: string) => `${p1}:[REDACTED]@`],
+];
+
+function redactSecrets(text: string): string {
+  if (!text) return text;
+  let out = text;
+  for (const [pattern, repl] of SECRET_REPLACERS) {
+    out = out.replace(pattern, repl as (substring: string, ...args: unknown[]) => string);
+  }
+  return out;
+}
+
+function redactMetadata<T>(obj: T): T {
+  if (typeof obj === "string") return redactSecrets(obj) as unknown as T;
+  if (Array.isArray(obj)) return obj.map(redactMetadata) as unknown as T;
+  if (obj !== null && typeof obj === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) out[k] = redactMetadata(v);
+    return out as T;
+  }
+  return obj;
+}
+
 function trunc(s: unknown, max = MAX_CHARS): string {
   if (s === null || s === undefined) return "";
   const str = typeof s === "string" ? s : JSON.stringify(s);
-  return str.length > max ? str.slice(0, max) + "…" : str;
+  const redacted = redactSecrets(str);
+  return redacted.length > max ? redacted.slice(0, max) + "…" : redacted;
 }
 
 function msToDate(ms: number | undefined): Date | undefined {
@@ -249,7 +301,10 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
       if (!turn || turn.emitted || !turn.userText || turn.steps.length === 0) continue;
 
       try {
-        const preview = turn.userText.trim().replace(/\n/g, " ").slice(0, 72);
+        // Redact before slicing for the trace name -- it's derived from the raw
+        // string directly, and a trace's *name* is exactly as visible in the
+        // Langfuse/LangWatch UI as its input/output.
+        const preview = redactSecrets(turn.userText).trim().replace(/\n/g, " ").slice(0, 72);
         const traceName = preview || "OpenCode Turn";
 
         const tags = ["opencode"];
@@ -279,7 +334,7 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
           tags,
           timestamp: turn.userTime,
           input: { role: "user", content: trunc(turn.userText) },
-          metadata: {
+          metadata: redactMetadata({
             source: "opencode",
             session_id: turn.sessionID,
             user_message_id: turn.userMessageID,
@@ -305,7 +360,7 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
             ...(IP_ADDRESS ? { ip_address: IP_ADDRESS } : {}),
             ...(OS_USER ? { os_user: OS_USER } : {}),
             ...(errorCount ? { error_count: errorCount } : {}),
-          },
+          }),
         });
 
         // One generation span per LLM step

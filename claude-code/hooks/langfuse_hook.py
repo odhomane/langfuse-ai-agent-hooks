@@ -7,6 +7,7 @@ Claude Code -> Langfuse hook
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -286,9 +287,65 @@ def extract_text(content: Any) -> str:
         return "\n".join([p for p in parts if p])
     return ""
 
+# ----------------- Secret redaction -----------------
+# Applied to every string before it leaves this process for Langfuse/LangWatch.
+# Tool output (Bash, ssh_execute, exec_command, ...) routinely contains real
+# credentials that happened to be on screen -- cat'd key files, env dumps,
+# psql connection strings -- with no awareness on the model's part that it's
+# sensitive. A retroactive scan of this exact instance's trace history (2026-08)
+# found real RSA private keys, GitHub PATs, Slack tokens, and hundreds of API
+# keys sitting in plaintext across Langfuse and LangWatch. This list mirrors
+# the patterns validated against that scan. Order matters: prefixed key formats
+# (sk-lf-, sk-lw-, ...) are matched before the generic sk-... catch-all so they
+# get their own specific label instead of falling through to "api_key", and so
+# a match is fully replaced before any later, broader pattern can re-scan it.
+_SECRET_REPLACERS: List[Tuple[Any, Any]] = [
+    (re.compile(r'-----BEGIN[ A-Z]*PRIVATE KEY-----.*?-----END[ A-Z]*PRIVATE KEY-----', re.DOTALL),
+     lambda m: '[REDACTED:private_key]'),
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), lambda m: '[REDACTED:aws_key_id]'),
+    (re.compile(r'\bsk-lf-[a-f0-9-]{20,}\b'), lambda m: '[REDACTED:langfuse_secret_key]'),
+    (re.compile(r'\bpk-lf-[a-f0-9-]{20,}\b'), lambda m: '[REDACTED:langfuse_public_key]'),
+    (re.compile(r'\bsk-lw-[A-Za-z0-9_]{20,}\b'), lambda m: '[REDACTED:langwatch_key]'),
+    (re.compile(r'\bgh[pousr]_[A-Za-z0-9]{30,}\b'), lambda m: '[REDACTED:github_token]'),
+    (re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b'), lambda m: '[REDACTED:slack_token]'),
+    (re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'), lambda m: '[REDACTED:jwt]'),
+    (re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'), lambda m: '[REDACTED:google_api_key]'),
+    (re.compile(r'\bnpm_[A-Za-z0-9]{30,}\b'), lambda m: '[REDACTED:npm_token]'),
+    (re.compile(r'\bsk-[A-Za-z0-9]{32,}\b'), lambda m: '[REDACTED:api_key]'),
+    # key=value / key: "value" assignments for common secret-ish key names -- keep the
+    # key name (useful for debugging) but drop the value. No leading \b before the
+    # key-name alternation: PGPASSWORD, MYSQL_PWD, DB_SECRET etc. have "password"/
+    # "secret" glued onto a prefix with no word boundary, and would otherwise slip
+    # through. Quote char (or none, for a bare shell `KEY=value`) is captured and
+    # echoed back on both sides via \2 so `KEY=value`, `KEY="value"` and `KEY: "value"`
+    # all redact correctly.
+    (re.compile(r'(?i)((?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token)["\']?\s*[:=]\s*)(["\']?)([^"\'\s]{6,})\2'),
+     lambda m: f'{m.group(1)}{m.group(2)}[REDACTED]{m.group(2)}'),
+    # scheme://user:password@host -- keep the shape, drop just the password.
+    (re.compile(r'([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s"\']+):[^@/\s"\']+@'), lambda m: f'{m.group(1)}:[REDACTED]@'),
+]
+
+def redact_secrets(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return text
+    for pattern, repl in _SECRET_REPLACERS:
+        text = pattern.sub(repl, text)
+    return text
+
+def redact_metadata(obj: Any) -> Any:
+    """Recursively redact string values in a metadata dict/list (e.g. hook stderr)."""
+    if isinstance(obj, str):
+        return redact_secrets(obj)
+    if isinstance(obj, list):
+        return [redact_metadata(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: redact_metadata(v) for k, v in obj.items()}
+    return obj
+
 def truncate_text(s: str, max_chars: int = MAX_CHARS) -> Tuple[str, Dict[str, Any]]:
     if s is None:
         return "", {"truncated": False, "orig_len": 0}
+    s = redact_secrets(s)
     orig_len = len(s)
     if orig_len <= max_chars:
         return s, {"truncated": False, "orig_len": orig_len}
@@ -705,7 +762,11 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
                 tools_used.append(n)
 
     # Trace name: user message preview (first 72 chars), fallback to turn number
-    user_preview = user_text_raw.strip().replace("\n", " ")[:72] if user_text_raw else ""
+    # Redact before slicing for the trace name -- this field isn't covered by
+    # truncate_text()'s redaction (it's derived from the raw string directly),
+    # and a trace's *name* is exactly as visible in the Langfuse/LangWatch UI
+    # as its input/output, so it needs the same treatment.
+    user_preview = redact_secrets(user_text_raw).strip().replace("\n", " ")[:72] if user_text_raw else ""
     trace_name = user_preview if user_preview else f"Claude Code - Turn {turn_num}"
 
     tags = ["claude-code"]
@@ -752,6 +813,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int, turn: Turn,
         hook_issues = [h for h in si.hook_events if h.get("stderr") or (h.get("exit_code") or 0) != 0]
         if hook_issues:
             trace_metadata["hook_issues"] = hook_issues
+
+    trace_metadata = redact_metadata(trace_metadata)
 
     with propagate_attributes(
         session_id=session_id,

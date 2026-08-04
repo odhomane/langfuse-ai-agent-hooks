@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import platform
+import re
 import socket
 import sys
 import threading
@@ -417,14 +418,58 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
         otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
     return langfuse._create_observation_from_otel_span(otel_span=otel_span, as_type=as_type, **kwargs)
 
+# ----------------- Secret redaction -----------------
+# Applied to every string before it leaves this process for Langfuse/LangWatch.
+# See claude-code/hooks/langfuse_hook.py for the full rationale — same patterns,
+# validated against a retroactive scan of this instance's real trace history
+# that found live RSA private keys, GitHub PATs, Slack tokens, and hundreds of
+# API keys sitting in plaintext.
+_SECRET_REPLACERS: List[Tuple[Any, Any]] = [
+    (re.compile(r'-----BEGIN[ A-Z]*PRIVATE KEY-----.*?-----END[ A-Z]*PRIVATE KEY-----', re.DOTALL),
+     lambda m: '[REDACTED:private_key]'),
+    (re.compile(r'\bAKIA[0-9A-Z]{16}\b'), lambda m: '[REDACTED:aws_key_id]'),
+    (re.compile(r'\bsk-lf-[a-f0-9-]{20,}\b'), lambda m: '[REDACTED:langfuse_secret_key]'),
+    (re.compile(r'\bpk-lf-[a-f0-9-]{20,}\b'), lambda m: '[REDACTED:langfuse_public_key]'),
+    (re.compile(r'\bsk-lw-[A-Za-z0-9_]{20,}\b'), lambda m: '[REDACTED:langwatch_key]'),
+    (re.compile(r'\bgh[pousr]_[A-Za-z0-9]{30,}\b'), lambda m: '[REDACTED:github_token]'),
+    (re.compile(r'\bxox[baprs]-[A-Za-z0-9-]{10,}\b'), lambda m: '[REDACTED:slack_token]'),
+    (re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b'), lambda m: '[REDACTED:jwt]'),
+    (re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'), lambda m: '[REDACTED:google_api_key]'),
+    (re.compile(r'\bnpm_[A-Za-z0-9]{30,}\b'), lambda m: '[REDACTED:npm_token]'),
+    (re.compile(r'\bsk-[A-Za-z0-9]{32,}\b'), lambda m: '[REDACTED:api_key]'),
+    (re.compile(r'(?i)((?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token)["\']?\s*[:=]\s*)(["\']?)([^"\'\s]{6,})\2'),
+     lambda m: f'{m.group(1)}{m.group(2)}[REDACTED]{m.group(2)}'),
+    (re.compile(r'([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s"\']+):[^@/\s"\']+@'), lambda m: f'{m.group(1)}:[REDACTED]@'),
+]
+
+def redact_secrets(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return text
+    for pattern, repl in _SECRET_REPLACERS:
+        text = pattern.sub(repl, text)
+    return text
+
+def redact_metadata(obj: Any) -> Any:
+    if isinstance(obj, str):
+        return redact_secrets(obj)
+    if isinstance(obj, list):
+        return [redact_metadata(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: redact_metadata(v) for k, v in obj.items()}
+    return obj
+
 def trunc(s: Any, n: int = MAX_CHARS) -> str:
     if s is None:
         return ""
     text = s if isinstance(s, str) else json.dumps(s, ensure_ascii=False)
+    text = redact_secrets(text)
     return text[:n] + ("…" if len(text) > n else "")
 
 def trace_name(turn: Turn) -> str:
-    preview = (turn.user_message or "").strip().replace("\n", " ")[:72]
+    # Redact before slicing -- this field isn't covered by trunc()'s redaction
+    # (it's derived from the raw message directly), and a trace's *name* is
+    # exactly as visible in the Langfuse/LangWatch UI as its input/output.
+    preview = redact_secrets(turn.user_message or "").strip().replace("\n", " ")[:72]
     return preview if preview else f"Turn {turn.turn_id[:8]}"
 
 def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
@@ -468,6 +513,8 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
         trace_metadata["time_to_first_token_ms"] = turn.time_to_first_token_ms
     if smeta.system_prompt:
         trace_metadata["system_prompt"] = trunc(smeta.system_prompt, 2000)
+
+    trace_metadata = redact_metadata(trace_metadata)
 
     with propagate_attributes(
         session_id=session_id,
