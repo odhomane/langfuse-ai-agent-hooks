@@ -321,7 +321,18 @@ _SECRET_REPLACERS: List[Tuple[Any, Any]] = [
     # `KEY="value"`, `KEY: "value"`, and natural-language `the pass is value` all
     # redact correctly -- "is" as a separator was added after live testing showed
     # "my temp pass is 1234Omkk1" slipping through the `:`/`=`-only version.
-    (re.compile(r'(?i)((?:password|passwd|pass|pwd|secret|api[_ \-]?key|access[_ \-]?key|auth[_ \-]?token)["\']?\s*(?:is\s+|[:=]\s*))(["\']?)([^"\'\s]{6,})\2'),
+    # Bare "key"/"token" subsume the old api_key/access_key/auth_token compounds
+    # (no leading \b, so "api_key"/"auth_token" still match via the "key"/"token"
+    # substring) -- added after live testing showed "here's my token, xyz890877"
+    # slipping through, since bare "token" wasn't a keyword at all and ", value"
+    # (comma-separated) wasn't a recognized separator.
+    # (?!\[REDACTED) keeps this from re-matching a placeholder an earlier, more
+    # specific pattern in this same list already produced (e.g. "the key is
+    # [REDACTED:langfuse_secret_key]" -- without the lookahead, "key is" + the
+    # placeholder text reads as its own key=value hit and collapses the specific
+    # label down to a bare "[REDACTED]"). Not a security issue either way -- both
+    # forms are fully redacted -- but the specific label is worth keeping.
+    (re.compile(r'(?i)((?:password|passwd|pass|pwd|secret|token|key)["\']?\s*(?:is\s+|[:=]\s*|,\s*))(["\']?)((?!\[REDACTED)[^"\'\s,]{6,})\2'),
      lambda m: f'{m.group(1)}{m.group(2)}[REDACTED]{m.group(2)}'),
     # scheme://user:password@host -- keep the shape, drop just the password.
     (re.compile(r'([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s"\']+):[^@/\s"\']+@'), lambda m: f'{m.group(1)}:[REDACTED]@'),

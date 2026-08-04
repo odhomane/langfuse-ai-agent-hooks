@@ -57,7 +57,7 @@ const SECRET_REPLACERS = [
     // name, drop the value. No leading \b: PGPASSWORD, MYSQL_PWD etc. have
     // "password"/"secret" glued onto a prefix with no word boundary.
     [
-        /((?:password|passwd|pass|pwd|secret|api[_ \-]?key|access[_ \-]?key|auth[_ \-]?token)["']?\s*(?:is\s+|[:=]\s*))(["']?)([^"'\s]{6,})\2/gi,
+        /((?:password|passwd|pass|pwd|secret|token|key)["']?\s*(?:is\s+|[:=]\s*|,\s*))(["']?)((?!\[REDACTED)[^"'\s,]{6,})\2/gi,
         (_m, p1, p2) => `${p1}${p2}[REDACTED]${p2}`,
     ],
     // scheme://user:password@host -- keep the shape, drop just the password.
