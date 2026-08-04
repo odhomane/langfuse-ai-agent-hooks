@@ -312,14 +312,16 @@ _SECRET_REPLACERS: List[Tuple[Any, Any]] = [
     (re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'), lambda m: '[REDACTED:google_api_key]'),
     (re.compile(r'\bnpm_[A-Za-z0-9]{30,}\b'), lambda m: '[REDACTED:npm_token]'),
     (re.compile(r'\bsk-[A-Za-z0-9]{32,}\b'), lambda m: '[REDACTED:api_key]'),
-    # key=value / key: "value" assignments for common secret-ish key names -- keep the
-    # key name (useful for debugging) but drop the value. No leading \b before the
-    # key-name alternation: PGPASSWORD, MYSQL_PWD, DB_SECRET etc. have "password"/
-    # "secret" glued onto a prefix with no word boundary, and would otherwise slip
-    # through. Quote char (or none, for a bare shell `KEY=value`) is captured and
-    # echoed back on both sides via \2 so `KEY=value`, `KEY="value"` and `KEY: "value"`
-    # all redact correctly.
-    (re.compile(r'(?i)((?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token)["\']?\s*[:=]\s*)(["\']?)([^"\'\s]{6,})\2'),
+    # key=value / key: "value" / "key is value" for common secret-ish key names --
+    # keep the key name (useful for debugging) but drop the value. No leading \b
+    # before the key-name alternation: PGPASSWORD, MYSQL_PWD, DB_SECRET etc. have
+    # "password"/"secret" glued onto a prefix with no word boundary, and would
+    # otherwise slip through. Quote char (or none, for a bare shell `KEY=value`)
+    # is captured and echoed back on both sides via \2 so `KEY=value`,
+    # `KEY="value"`, `KEY: "value"`, and natural-language `the pass is value` all
+    # redact correctly -- "is" as a separator was added after live testing showed
+    # "my temp pass is 1234Omkk1" slipping through the `:`/`=`-only version.
+    (re.compile(r'(?i)((?:password|passwd|pass|pwd|secret|api[_ \-]?key|access[_ \-]?key|auth[_ \-]?token)["\']?\s*(?:is\s+|[:=]\s*))(["\']?)([^"\'\s]{6,})\2'),
      lambda m: f'{m.group(1)}{m.group(2)}[REDACTED]{m.group(2)}'),
     # scheme://user:password@host -- keep the shape, drop just the password.
     (re.compile(r'([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s"\']+):[^@/\s"\']+@'), lambda m: f'{m.group(1)}:[REDACTED]@'),

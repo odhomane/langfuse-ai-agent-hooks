@@ -307,7 +307,7 @@ _SECRET_REPLACERS: List[Tuple[Any, Any]] = [
     (re.compile(r'\bAIza[0-9A-Za-z_-]{35}\b'), lambda m: '[REDACTED:google_api_key]'),
     (re.compile(r'\bnpm_[A-Za-z0-9]{30,}\b'), lambda m: '[REDACTED:npm_token]'),
     (re.compile(r'\bsk-[A-Za-z0-9]{32,}\b'), lambda m: '[REDACTED:api_key]'),
-    (re.compile(r'(?i)((?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token)["\']?\s*[:=]\s*)(["\']?)([^"\'\s]{6,})\2'),
+    (re.compile(r'(?i)((?:password|passwd|pass|pwd|secret|api[_ \-]?key|access[_ \-]?key|auth[_ \-]?token)["\']?\s*(?:is\s+|[:=]\s*))(["\']?)([^"\'\s]{6,})\2'),
      lambda m: f'{m.group(1)}{m.group(2)}[REDACTED]{m.group(2)}'),
     (re.compile(r'([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s"\']+):[^@/\s"\']+@'), lambda m: f'{m.group(1)}:[REDACTED]@'),
 ]
